@@ -20,10 +20,30 @@ pub use adc::inputctrl::GAIN_A as Gain;
 /// Reference voltage (or its source)
 pub use adc::refctrl::REFSEL_A as Reference;
 
+/// An ADC where results are accessible via interrupt servicing.
+pub struct InterruptAdc<ADC, C>
+where
+    C: ConversionMode<ADC>,
+{
+    adc: Adc<ADC>,
+    m: core::marker::PhantomData<C>,
+}
+
 /// `Adc` encapsulates the device ADC
 pub struct Adc<ADC> {
     adc: ADC,
 }
+
+/// Describes how an interrupt-driven ADC should finalize the peripheral
+/// upon the completion of a conversion.
+pub trait ConversionMode<ADC> {
+    fn on_start(adc: &mut Adc<ADC>);
+    fn on_complete(adc: &mut Adc<ADC>);
+    fn on_stop(adc: &mut Adc<ADC>);
+}
+
+pub struct SingleConversion;
+pub struct FreeRunning;
 
 impl Adc<ADC> {
     /// Create a new `Adc` instance. The default configuration is:
@@ -123,21 +143,119 @@ impl Adc<ADC> {
         while self.adc.status.read().syncbusy().bit_is_set() {}
     }
 
-    fn convert(&mut self) -> u16 {
+    #[inline(always)]
+    fn start_conversion(&mut self) {
+        // start conversion
         self.adc.swtrig.modify(|_, w| w.start().set_bit());
-        while self.adc.intflag.read().resrdy().bit_is_clear() {}
-        while self.adc.status.read().syncbusy().bit_is_set() {}
-
-        // Clear the interrupt flag
-        self.adc.intflag.modify(|_, w| w.resrdy().set_bit());
-
-        // Start conversion again, since The first conversion after the reference is
-        // changed must not be used.
+        // do it again because the datasheet tells us to
         self.adc.swtrig.modify(|_, w| w.start().set_bit());
-        while self.adc.intflag.read().resrdy().bit_is_clear() {}
+    }
+
+    fn enable_freerunning(&mut self) {
+        self.adc.ctrlb.modify(|_, w| w.freerun().set_bit());
         while self.adc.status.read().syncbusy().bit_is_set() {}
+    }
+
+    fn disable_freerunning(&mut self) {
+        self.adc.ctrlb.modify(|_, w| w.freerun().set_bit());
+        while self.adc.status.read().syncbusy().bit_is_set() {}
+    }
+
+    fn synchronous_convert(&mut self) -> u16 {
+        self.start_conversion();
+        while self.adc.intflag.read().resrdy().bit_is_clear() {}
 
         self.adc.result.read().result().bits()
+    }
+
+    /// Enables an interrupt when conversion is ready.
+    fn enable_interrupts(&mut self) {
+        self.adc.intflag.write(|w| w.resrdy().set_bit());
+        self.adc.intenset.write(|w| w.resrdy().set_bit());
+    }
+
+    /// Disables the interrupt for when conversion is ready.
+    fn disable_interrupts(&mut self) {
+        self.adc.intenclr.write(|w| w.resrdy().set_bit());
+    }
+
+    fn service_interrupt_ready(&mut self) -> Option<u16> {
+        if self.adc.intflag.read().resrdy().bit_is_set() {
+            self.adc.intflag.write(|w| w.resrdy().set_bit());
+
+            Some(self.adc.result.read().result().bits())
+        } else {
+            None
+        }
+    }
+
+    /// Sets the mux to a particular pin. The pin mux is enabled-protected,
+    /// so must be called while the peripheral is disabled.
+    fn mux<PIN: Channel<ADC, ID=u8>>(&mut self, _pin: &mut PIN) {
+        let chan = PIN::channel();
+        while self.adc.status.read().syncbusy().bit_is_set() {}
+        self.adc.inputctrl.modify(|_, w| unsafe { w.muxpos().bits(chan) });
+    }
+}
+
+impl ConversionMode<ADC> for SingleConversion  {
+    fn on_start(_adc: &mut Adc<ADC>) {
+    }
+    fn on_complete(adc: &mut Adc<ADC>) {
+        adc.disable_interrupts();
+        adc.power_down();
+    }
+    fn on_stop(_adc: &mut Adc<ADC>) {
+    }
+}
+
+impl ConversionMode<ADC> for FreeRunning {
+    fn on_start(adc: &mut Adc<ADC>) {
+        adc.enable_freerunning();
+    }
+    fn on_complete(_adc: &mut Adc<ADC>) {
+    }
+    fn on_stop(adc: &mut Adc<ADC>) {
+        adc.disable_interrupts();
+        adc.power_down();
+        adc.disable_freerunning();
+    }
+}
+
+impl<C> InterruptAdc<ADC, C>
+    where C: ConversionMode<ADC>
+{
+    pub fn service_interrupt_ready(&mut self) -> Option<u16> {
+        if let Some(res) = self.adc.service_interrupt_ready() {
+            C::on_complete(&mut self.adc);
+            Some(res)
+        } else {
+            None
+        }
+    }
+
+    /// Starts a conversion sampling the specified pin.
+    pub fn start_conversion<PIN: Channel<ADC, ID=u8>>(&mut self, pin: &mut PIN) {
+        self.adc.mux(pin);
+        self.adc.power_up();
+        C::on_start(&mut self.adc);
+        self.adc.enable_interrupts();
+        self.adc.start_conversion();
+    }
+
+    pub fn stop_conversion(&mut self) {
+        C::on_stop(&mut self.adc);
+    }
+}
+
+impl<C> From<Adc<ADC>> for InterruptAdc<ADC, C>
+    where C: ConversionMode<ADC>
+{
+    fn from(adc: Adc<ADC>) -> Self {
+        Self {
+            adc,
+            m: core::marker::PhantomData{},
+        }
     }
 }
 
@@ -148,15 +266,10 @@ where
 {
     type Error = ();
 
-    fn read(&mut self, _pin: &mut PIN) -> nb::Result<WORD, Self::Error> {
-        let chan = PIN::channel();
-        while self.adc.status.read().syncbusy().bit_is_set() {}
-
-        self.adc
-            .inputctrl
-            .modify(|_, w| unsafe { w.muxpos().bits(chan) });
+    fn read(&mut self, pin: &mut PIN) -> nb::Result<WORD, Self::Error> {
+        self.mux(pin);
         self.power_up();
-        let result = self.convert();
+        let result = self.synchronous_convert();
         self.power_down();
 
         Ok(result.into())
