@@ -69,18 +69,23 @@ impl Adc<ADC> {
         });
         while adc.status.read().syncbusy().bit_is_set() {}
 
-        adc.sampctrl.modify(|_, w| unsafe { w.samplen().bits(5) }); //sample length
-        while adc.status.read().syncbusy().bit_is_set() {}
-
         adc.inputctrl.modify(|_, w| w.muxneg().gnd()); // No negative input (internal gnd)
         while adc.status.read().syncbusy().bit_is_set() {}
 
         let mut newadc = Self { adc };
+        newadc.sample_length(5);
         newadc.samples(adc::avgctrl::SAMPLENUM_A::_1);
         newadc.gain(adc::inputctrl::GAIN_A::DIV2);
         newadc.reference(adc::refctrl::REFSEL_A::INTVCC1);
 
         newadc
+    }
+
+    /// Set how many adc peripheral clock cycles (post-prescaler)
+    /// are needed to take a  single sample. 
+    pub fn sample_length(&mut self, length: u8) {
+        self.adc.sampctrl.modify(|_, w| unsafe { w.samplen().bits(length) }); //sample length
+        while self.adc.status.read().syncbusy().bit_is_set() {}
     }
 
     /// Set the sample rate
